@@ -10,6 +10,11 @@ import click
 MAX_RETRY_BACKOFF_TIME = 30  # seconds
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36 Edg/109.0.1518.78"
 VALID_APPOINTMENT_TYPES = ["PASSPORT"]
+RETRIABLE_HTTP_ERRORS = (
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientResponseError,
+    aiohttp.ContentTypeError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +29,7 @@ def get_next_date(date: datetime.date, max_lookahead: int = 30) -> datetime.date
 
 @backoff.on_exception(
     backoff.expo,
-    aiohttp.ClientError,
+    RETRIABLE_HTTP_ERRORS,
     max_time=MAX_RETRY_BACKOFF_TIME,
 )
 async def send_discord_webhook(
@@ -76,7 +81,7 @@ class AppointmentWatcher:
 
     @backoff.on_exception(
         backoff.expo,
-        aiohttp.ClientError,
+        RETRIABLE_HTTP_ERRORS,
         max_time=MAX_RETRY_BACKOFF_TIME,
     )
     async def list_facility_schedules(
@@ -103,7 +108,7 @@ class AppointmentWatcher:
 
     @backoff.on_exception(
         backoff.expo,
-        aiohttp.ClientError,
+        RETRIABLE_HTTP_ERRORS,
         max_time=MAX_RETRY_BACKOFF_TIME,
     )
     async def list_times_for_facility(
