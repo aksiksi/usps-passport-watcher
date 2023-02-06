@@ -27,11 +27,10 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-def get_next_date(date: datetime.date, max_lookahead: int = 30) -> datetime.date:
-    today = datetime.date.today()
+def get_next_date(date: datetime.date, min_date: datetime.date, max_date: datetime.date) -> datetime.date:
     next_date = date + datetime.timedelta(days=1)
-    if next_date > today + datetime.timedelta(days=max_lookahead):
-        return today
+    if next_date > max_date:
+        return min_date
     return next_date
 
 
@@ -240,7 +239,7 @@ class AppointmentWatcher:
                 else:
                     message = f"Found passport appointment at {appt_time}; schedule it here: https://tools.usps.com/rcas.htm."
 
-                logger.info(message)
+                logger.warning(message)
 
                 if self.discord_webhook:
                     await send_discord_webhook(session, self.discord_webhook, message)
@@ -258,21 +257,30 @@ class AppointmentWatcher:
 
     async def run(
         self,
-        date: Optional[datetime.date] = None,
+        start_date: Optional[datetime.date] = None,
+        end_date: Optional[datetime.date] = None,
     ) -> Optional[datetime.datetime]:
-        """If a date is provided, this method will only check the given date."""
-        if date is None:
-            next_date = datetime.date.today()
-        else:
-            next_date = date
+        min_date = datetime.date.today()
+        max_date = min_date + datetime.timedelta(days=30)
+        if not start_date:
+            start_date = min_date
+        elif start_date < min_date:
+            logger.warning(f"Start date must be greater than {min_date}; setting to that...")
+            start_date = min_date
+        if not end_date:
+            end_date = max_date
+        elif end_date > max_date:
+            logger.warning(f"End date must be less than {max_date}; setting to that...")
+            end_date = max_date
+
+        next_date = start_date
 
         while True:
             appt_time = await self.run_for_date(next_date)
             if appt_time:
                 return appt_time
 
-            if date is None:
-                next_date = get_next_date(next_date)
+            next_date = get_next_date(next_date, start_date, end_date)
 
             await asyncio.sleep(self.interval)
 
@@ -315,9 +323,14 @@ class AppointmentWatcher:
     show_default=True,
 )
 @click.option(
-    "--date",
+    "--start-date",
     type=str,
-    help="Run for just this date. Format: YYYYMMDD.",
+    help="Format: YYYYMMDD.",
+)
+@click.option(
+    "--end-date",
+    type=str,
+    help="Format: YYYYMMDD.",
 )
 @click.option(
     "--schedule/--no-schedule",
@@ -351,7 +364,8 @@ def watcher(
     num_adults: int,
     num_minors: int,
     appointment_type: str,
-    date: Optional[str],
+    start_date: Optional[str],
+    end_date: Optional[str],
     schedule: bool,
     name: Optional[str],
     email: Optional[str],
@@ -370,8 +384,10 @@ def watcher(
         city, state = city_and_state.split(",")
         city, state = city.strip(), state.strip()
 
-    if date:
-        date = datetime.datetime.strptime(date, "%Y%m%d").date()
+    if start_date:
+        start_date = datetime.datetime.strptime(start_date, "%Y%m%d").date()
+    if end_date:
+        end_date = datetime.datetime.strptime(end_date, "%Y%m%d").date()
 
     aw = AppointmentWatcher(
         zip=zip,
@@ -388,7 +404,7 @@ def watcher(
         phone=phone,
         discord_webhook=discord_webhook,
     )
-    asyncio.run(aw.run(date))
+    asyncio.run(aw.run(start_date=start_date, end_date=end_date))
 
 
 if __name__ == "__main__":

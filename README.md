@@ -3,6 +3,7 @@
 ### Usage
 
 ```
+$ python watcher.py --help
 Usage: watcher.py [OPTIONS]
 
 Options:
@@ -17,7 +18,8 @@ Options:
   --num-minors INTEGER           Number of minors for appointment.  [default:
                                  0]
   --appointment-type [PASSPORT]  [default: PASSPORT]
-  --date TEXT                    Run for just this date. Format: YYYYMMDD.
+  --start-date TEXT              Format: YYYYMMDD.
+  --end-date TEXT                Format: YYYYMMDD.
   --schedule / --no-schedule     If set, automatically schedule an
                                  appointment.
   --name TEXT                    Name for the appoinment.
