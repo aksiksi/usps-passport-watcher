@@ -22,16 +22,10 @@ RETRIABLE_HTTP_ERRORS = (
     aiohttp.ClientResponseError,
     aiohttp.ContentTypeError,
 )
+NUM_CONCURRENT_DATES = 5
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
-def get_next_date(date: datetime.date, min_date: datetime.date, max_date: datetime.date) -> datetime.date:
-    next_date = date + datetime.timedelta(days=1)
-    if next_date > max_date:
-        return min_date
-    return next_date
 
 
 @backoff.on_exception(
@@ -192,18 +186,19 @@ class AppointmentWatcher:
             "passportPhotoIndicator": passport_photo_idx,
             "ipAddress": "8.8.8.8",
         }
-        async with session.post(self.CREATE_APPOINTMENT_URL, json=payload, headers=HEADERS) as resp:
+        async with session.post(
+            self.CREATE_APPOINTMENT_URL, json=payload, headers=HEADERS
+        ) as resp:
             resp.raise_for_status()
             body = await resp.json()
             return body["scheduling"]["confirmationNumber"]
 
-    async def run_for_date(self, date: datetime.date) -> Optional[datetime.datetime]:
+    async def run_for_date(self, date: datetime.date) -> tuple[Optional[datetime.datetime], datetime.date]:
         async with aiohttp.ClientSession(headers=HEADERS) as session:
-            # Find a facility with an empty slot on the date (+-1 day).
+            # Find a facility with an empty slot on the date.
             schedules = await self.list_facility_schedules(session, date)
             facility_id: Optional[int] = None
             for facility in schedules:
-                # Check if the date (+-1 day) is available.
                 for date_info in facility["date"]:
                     result_date = datetime.datetime.strptime(
                         date_info["date"], "%Y%m%d"
@@ -212,7 +207,7 @@ class AppointmentWatcher:
                         facility_id = facility["fdbId"]
                         break
             if facility_id is None:
-                return None
+                return None, date
 
             # Check appointment times for the facility on the given date.
             appt_time: Optional[datetime.datetime] = None
@@ -220,7 +215,9 @@ class AppointmentWatcher:
                 session, date, facility_id
             ):
                 # Yes, this is how they return available time slots...
-                is_slot_free = time_info["appointmentStatus"].lower() == "available" and (
+                is_slot_free = time_info[
+                    "appointmentStatus"
+                ].lower() == "available" and (
                     "color" not in time_info or time_info["color"] != "gray"
                 )
                 if is_slot_free:
@@ -253,34 +250,60 @@ class AppointmentWatcher:
                         f"No {self.appointment_type} appointments found on {date} within {self.radius} miles of {self.city}, {self.state}"
                     )
 
-            return appt_time
+            return appt_time, date
+
+    def get_valid_dates(
+        self,
+        start_date: Optional[datetime.date] = None,
+        end_date: Optional[datetime.date] = None,
+    ) -> list[datetime.date]:
+        min_date = datetime.date.today() + datetime.timedelta(days=1)
+        max_date = min_date + datetime.timedelta(days=30)
+        if start_date:
+            if start_date < min_date:
+                logger.warning(
+                    f"Start date must be greater than {min_date}; setting to that..."
+                )
+            else:
+                min_date = start_date
+        if end_date:
+            if end_date > max_date:
+                logger.warning(
+                    f"End date must be less than {max_date}; setting to that..."
+                )
+            else:
+                max_date = end_date
+
+        valid_dates = []
+        d = min_date
+        while d <= max_date:
+            valid_dates.append(d)
+            d += datetime.timedelta(days=1)
+
+        return valid_dates
 
     async def run(
         self,
         start_date: Optional[datetime.date] = None,
         end_date: Optional[datetime.date] = None,
     ) -> Optional[datetime.datetime]:
-        min_date = datetime.date.today()
-        max_date = min_date + datetime.timedelta(days=30)
-        if not start_date:
-            start_date = min_date
-        elif start_date < min_date:
-            logger.warning(f"Start date must be greater than {min_date}; setting to that...")
-            start_date = min_date
-        if not end_date:
-            end_date = max_date
-        elif end_date > max_date:
-            logger.warning(f"End date must be less than {max_date}; setting to that...")
-            end_date = max_date
-
-        next_date = start_date
-
         while True:
-            appt_time = await self.run_for_date(next_date)
-            if appt_time:
-                return appt_time
+            valid_dates = self.get_valid_dates(start_date, end_date)
 
-            next_date = get_next_date(next_date, start_date, end_date)
+            # Group the valid dates into chunks that will be processed concurrently..
+            chunk_iter = (
+                valid_dates[i : i + NUM_CONCURRENT_DATES]
+                for i in range(0, len(valid_dates), NUM_CONCURRENT_DATES)
+            )
+
+            for chunk in chunk_iter:
+                tasks = [self.run_for_date(d) for d in chunk]
+                # Sort results by ascending date.
+                results = sorted(await asyncio.gather(*tasks), key=lambda x: x[1])
+                for appt_time, _ in results:
+                    if appt_time:
+                        # Return the first/earliest valid date.
+                        return appt_time
 
             await asyncio.sleep(self.interval)
 
@@ -297,7 +320,7 @@ class AppointmentWatcher:
 )
 @click.option(
     "--interval",
-    default=3,
+    default=5,
     type=int,
     help="Interval in seconds between processing each date.",
     show_default=True,
