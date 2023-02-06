@@ -9,6 +9,13 @@ import click
 
 MAX_RETRY_BACKOFF_TIME = 30  # seconds
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36 Edg/109.0.1518.78"
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Content-Type": "application/json;charset=utf-8",
+    "x-requested-with": "XMLHttpRequest",
+    "origin": "https://tools.usps.com",
+    "referer": "https://tools.usps.com/rcas.htm",
+}
 VALID_APPOINTMENT_TYPES = ["PASSPORT"]
 RETRIABLE_HTTP_ERRORS = (
     aiohttp.ClientConnectionError,
@@ -17,6 +24,7 @@ RETRIABLE_HTTP_ERRORS = (
 )
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def get_next_date(date: datetime.date, max_lookahead: int = 30) -> datetime.date:
@@ -51,6 +59,9 @@ class AppointmentWatcher:
     FACILITY_SCHEDULE_SEARCH_URL = (
         "https://tools.usps.com/UspsToolsRestServices/rest/v2/facilityScheduleSearch"
     )
+    CREATE_APPOINTMENT_URL = (
+        "https://tools.usps.com/UspsToolsRestServices/rest/v2/createAppointment"
+    )
 
     def __init__(
         self,
@@ -62,12 +73,21 @@ class AppointmentWatcher:
         num_adults: int = 1,
         num_minors: int = 0,
         appointment_type: str = "PASSPORT",
+        schedule: bool = False,
+        name: Optional[str] = None,
+        email: Optional[str] = None,
+        phone: Optional[str] = None,
         discord_webhook: Optional[str] = None,
     ) -> None:
         if zip is None and city is None and state is None:
             raise ValueError("One of ZIP or city/state must be specified.")
         elif zip is None and (city is None or state is None):
             raise ValueError("Both city and state must be specified.")
+
+        if schedule and (name is None or email is None or phone is None):
+            raise ValueError(
+                "Name, email, and phone must be provided to schedule an appointment."
+            )
 
         self.zip = zip
         self.city = city
@@ -77,6 +97,10 @@ class AppointmentWatcher:
         self.num_adults = num_adults
         self.num_minors = num_minors
         self.appointment_type = appointment_type.upper()
+        self.schedule = schedule
+        self.name = name
+        self.email = email
+        self.phone = phone
         self.discord_webhook = discord_webhook
 
     @backoff.on_exception(
@@ -95,7 +119,7 @@ class AppointmentWatcher:
             "state": self.state or "",
             "zip5": self.zip or "",
             "radius": f"{self.radius}",
-            "poScheduleType": f"{self.appointment_type}",
+            "poScheduleType": self.appointment_type,
             "numberOfAdults": f"{self.num_adults}",
             "numberOfMinors": f"{self.num_minors}",
         }
@@ -120,7 +144,7 @@ class AppointmentWatcher:
         payload = {
             "date": date.strftime("%Y%m%d"),
             "fdbId": [f"{fdbID}"],
-            "productType": f"{self.appointment_type}",
+            "productType": self.appointment_type,
             "numberOfAdults": f"{self.num_adults}",
             "numberOfMinors": f"{self.num_minors}",
             "skipEndOfDayRecord": True,
@@ -130,38 +154,105 @@ class AppointmentWatcher:
             body = await resp.json()
             return body["appointmentTimeDetailExtended"]
 
+    # @backoff.on_exception(
+    #     backoff.expo,
+    #     RETRIABLE_HTTP_ERRORS,
+    #     max_time=MAX_RETRY_BACKOFF_TIME,
+    # )
+    async def create_appointment(
+        self,
+        session: aiohttp.ClientSession,
+        appt_time: datetime.datetime,
+        fdbId: int,
+    ) -> str:
+        # NOTE(aksiksi): This isn't working, likely due to missing cookies.
+        # Returns 405 (method not allowed).
+        first_name, last_name = self.name.split(" ")
+        area_code, exchange, line = self.phone.split("-")
+        passport_photo_idx = 0 if self.appointment_type == "PASSPORT" else 1
+        payload = {
+            "customer": {
+                "firstName": f"{first_name.upper()}",
+                "lastName": f"{last_name.upper()}",
+                "regId": "",
+            },
+            "customerEmailAddress": f"{self.email.upper()}",
+            "customerPhone": {
+                "areaCode": f"{area_code}",
+                "exchange": f"{exchange}",
+                "line": f"{line}",
+                "textable": False,
+            },
+            "fdbId": f"{fdbId}",
+            "date": appt_time.strftime("%Y%m%d"),
+            "time": appt_time.strftime("%I:%M %p").lower(),
+            "schedulingType": self.appointment_type,
+            "serviceCenter": "Web Service Center",
+            "numberOfAdults": f"{self.num_adults}",
+            "numberOfMinors": f"{self.num_minors}",
+            "passportPhotoIndicator": passport_photo_idx,
+            "ipAddress": "8.8.8.8",
+        }
+        async with session.post(self.CREATE_APPOINTMENT_URL, json=payload, headers=HEADERS) as resp:
+            resp.raise_for_status()
+            body = await resp.json()
+            return body["scheduling"]["confirmationNumber"]
+
     async def run_for_date(self, date: datetime.date) -> Optional[datetime.datetime]:
-        async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
             # Find a facility with an empty slot on the date (+-1 day).
             schedules = await self.list_facility_schedules(session, date)
-            facility_id: int = None
+            facility_id: Optional[int] = None
             for facility in schedules:
                 # Check if the date (+-1 day) is available.
                 for date_info in facility["date"]:
-                    if date_info["status"]:
+                    result_date = datetime.datetime.strptime(
+                        date_info["date"], "%Y%m%d"
+                    ).date()
+                    if result_date == date and date_info["status"]:
                         facility_id = facility["fdbId"]
                         break
             if facility_id is None:
                 return None
 
-            # Check appointment times for all 3 dates.
+            # Check appointment times for the facility on the given date.
             appt_time: Optional[datetime.datetime] = None
-            for d in [
-                date - datetime.timedelta(days=1),
-                date,
-                date + datetime.timedelta(days=1),
-            ]:
-                for time_info in await self.list_times_for_facility(
-                    session, d, facility_id
-                ):
-                    if time_info["selectable"]:
-                        appt_time = datetime.datetime.fromisoformat(
-                            time_info["startDateTime"]
-                        )
+            for time_info in await self.list_times_for_facility(
+                session, date, facility_id
+            ):
+                # Yes, this is how they return available time slots...
+                is_slot_free = time_info["appointmentStatus"].lower() == "available" and (
+                    "color" not in time_info or time_info["color"] != "gray"
+                )
+                if is_slot_free:
+                    appt_time = datetime.datetime.fromisoformat(
+                        time_info["startDateTime"]
+                    )
+                    break
 
-            if appt_time is not None and self.discord_webhook is not None:
-                message = f"Found passport appointment at {appt_time}; schedule it here: https://tools.usps.com/rcas.htm"
-                await send_discord_webhook(session, self.discord_webhook, message)
+            if appt_time:
+                if self.schedule:
+                    confirmation_number = await self.create_appointment(
+                        session, appt_time, facility_id
+                    )
+                    confirmation_url = f"https://tools.usps.com/rcas-confirmation.htm?confirmationNumber={confirmation_number}"
+                    message = f"Found & scheduled passport appointment at {appt_time}. Visit {confirmation_url} to manage your appointment."
+                else:
+                    message = f"Found passport appointment at {appt_time}; schedule it here: https://tools.usps.com/rcas.htm."
+
+                logger.info(message)
+
+                if self.discord_webhook:
+                    await send_discord_webhook(session, self.discord_webhook, message)
+            else:
+                if self.zip:
+                    logger.warning(
+                        f"No {self.appointment_type} appointments found on {date} within {self.radius} miles of ZIP {self.zip}"
+                    )
+                else:
+                    logger.warning(
+                        f"No {self.appointment_type} appointments found on {date} within {self.radius} miles of {self.city}, {self.state}"
+                    )
 
             return appt_time
 
@@ -169,24 +260,19 @@ class AppointmentWatcher:
         self,
         date: Optional[datetime.date] = None,
     ) -> Optional[datetime.datetime]:
+        """If a date is provided, this method will only check the given date."""
         if date is None:
-            date = datetime.date.today()
+            next_date = datetime.date.today()
+        else:
+            next_date = date
 
         while True:
-            appt_time = await self.run_for_date(date)
-            if appt_time is not None:
+            appt_time = await self.run_for_date(next_date)
+            if appt_time:
                 return appt_time
 
-            if self.zip:
-                logger.warning(
-                    f"No {self.appointment_type} appointments found on {date} within {self.radius} miles of ZIP {self.zip}"
-                )
-            else:
-                logger.warning(
-                    f"No {self.appointment_type} appointments found on {date} within {self.radius} miles of {self.city}, {self.state}"
-                )
-
-            date = get_next_date(date)
+            if date is None:
+                next_date = get_next_date(next_date)
 
             await asyncio.sleep(self.interval)
 
@@ -199,29 +285,60 @@ class AppointmentWatcher:
     default=10,
     type=int,
     help="Radius to search for locations, in miles.",
+    show_default=True,
 )
 @click.option(
     "--interval",
     default=3,
     type=int,
     help="Interval in seconds between processing each date.",
+    show_default=True,
 )
 @click.option(
     "--num-adults",
     default=1,
     type=int,
     help="Number of adults for appointment.",
+    show_default=True,
 )
 @click.option(
     "--num-minors",
     default=0,
     type=int,
     help="Number of minors for appointment.",
+    show_default=True,
 )
 @click.option(
     "--appointment-type",
     type=click.Choice(VALID_APPOINTMENT_TYPES, case_sensitive=False),
     default="PASSPORT",
+    show_default=True,
+)
+@click.option(
+    "--date",
+    type=str,
+    help="Run for just this date. Format: YYYYMMDD.",
+)
+@click.option(
+    "--schedule/--no-schedule",
+    default=False,
+    type=bool,
+    help="If set, automatically schedule an appointment.",
+)
+@click.option(
+    "--name",
+    type=str,
+    help="Name for the appoinment.",
+)
+@click.option(
+    "--email",
+    type=str,
+    help="Email for the appoinment.",
+)
+@click.option(
+    "--phone",
+    type=str,
+    help="Phone number for the appointment (format: 444-555-6666).",
 )
 @click.option(
     "--discord-webhook", type=str, help="Discord webhook URL to send notifications to."
@@ -234,6 +351,11 @@ def watcher(
     num_adults: int,
     num_minors: int,
     appointment_type: str,
+    date: Optional[str],
+    schedule: bool,
+    name: Optional[str],
+    email: Optional[str],
+    phone: Optional[str],
     discord_webhook: Optional[str],
 ):
     if zip is None and city_and_state is None:
@@ -248,6 +370,9 @@ def watcher(
         city, state = city_and_state.split(",")
         city, state = city.strip(), state.strip()
 
+    if date:
+        date = datetime.datetime.strptime(date, "%Y%m%d").date()
+
     aw = AppointmentWatcher(
         zip=zip,
         city=city,
@@ -257,9 +382,13 @@ def watcher(
         num_adults=num_adults,
         num_minors=num_minors,
         appointment_type=appointment_type,
+        schedule=schedule,
+        name=name,
+        email=email,
+        phone=phone,
         discord_webhook=discord_webhook,
     )
-    asyncio.run(aw.run())
+    asyncio.run(aw.run(date))
 
 
 if __name__ == "__main__":
