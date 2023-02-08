@@ -193,7 +193,9 @@ class AppointmentWatcher:
             body = await resp.json()
             return body["scheduling"]["confirmationNumber"]
 
-    async def run_for_date(self, date: datetime.date) -> tuple[Optional[datetime.datetime], datetime.date]:
+    async def run_for_date(
+        self, date: datetime.date
+    ) -> tuple[Optional[datetime.datetime], datetime.date]:
         async with aiohttp.ClientSession(headers=HEADERS) as session:
             # Find a facility with an empty slot on the date.
             schedules = await self.list_facility_schedules(session, date)
@@ -208,6 +210,9 @@ class AppointmentWatcher:
                         break
             if facility_id is None:
                 return None, date
+
+            facility_addr = facility["address"]
+            location = f"{facility_addr['addressLineOne']}, {facility_addr['city']}, {facility_addr['postalCode']}"
 
             # Check appointment times for the facility on the given date.
             appt_time: Optional[datetime.datetime] = None
@@ -232,9 +237,9 @@ class AppointmentWatcher:
                         session, appt_time, facility_id
                     )
                     confirmation_url = f"https://tools.usps.com/rcas-confirmation.htm?confirmationNumber={confirmation_number}"
-                    message = f"Found & scheduled passport appointment at {appt_time}. Visit {confirmation_url} to manage your appointment."
+                    message = f"Found & scheduled passport appointment on {appt_time} at {location}. Visit {confirmation_url} to manage your appointment."
                 else:
-                    message = f"Found passport appointment at {appt_time}; schedule it here: https://tools.usps.com/rcas.htm."
+                    message = f"Found passport appointment on {appt_time} at {location}; schedule it here: https://tools.usps.com/rcas.htm."
 
                 logger.warning(message)
 
