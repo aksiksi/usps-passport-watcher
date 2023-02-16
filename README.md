@@ -1,5 +1,15 @@
 ## USPS Passport Appointment Watcher
 
+### Install Dependencies
+
+```
+# Using Pip
+pip install -r requirements.txt
+
+# Using Pipenv
+pipenv shell
+```
+
 ### Usage
 
 ```
