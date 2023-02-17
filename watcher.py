@@ -1,7 +1,7 @@
 import asyncio
 import datetime
 import logging
-from typing import Optional
+from typing import Optional, Set
 
 import aiohttp
 import backoff
@@ -58,7 +58,7 @@ class AppointmentWatcher:
 
     def __init__(
         self,
-        zip: Optional[str],
+        zip_code: Optional[str],
         city: Optional[str],
         state: Optional[str],
         radius: int = 10,
@@ -72,9 +72,9 @@ class AppointmentWatcher:
         phone: Optional[str] = None,
         discord_webhook: Optional[str] = None,
     ) -> None:
-        if zip is None and city is None and state is None:
+        if zip_code is None and city is None and state is None:
             raise ValueError("One of ZIP or city/state must be specified.")
-        elif zip is None and (city is None or state is None):
+        elif zip_code is None and (city is None or state is None):
             raise ValueError("Both city and state must be specified.")
 
         if schedule and (name is None or email is None or phone is None):
@@ -82,7 +82,7 @@ class AppointmentWatcher:
                 "Name, email, and phone must be provided to schedule an appointment."
             )
 
-        self.zip = zip
+        self.zip_code = zip_code
         self.city = city
         self.state = state
         self.radius = radius
@@ -95,6 +95,10 @@ class AppointmentWatcher:
         self.email = email
         self.phone = phone
         self.discord_webhook = discord_webhook
+
+        # Keeps track of what appointments we've found to avoid sending
+        # duplicate notifications.
+        self.appointments_found: Set[str] = set()
 
     @backoff.on_exception(
         backoff.expo,
@@ -110,7 +114,7 @@ class AppointmentWatcher:
             "date": date.strftime("%Y%m%d"),
             "city": self.city or "",
             "state": self.state or "",
-            "zip5": self.zip or "",
+            "zip5": self.zip_code or "",
             "radius": f"{self.radius}",
             "poScheduleType": self.appointment_type,
             "numberOfAdults": f"{self.num_adults}",
@@ -193,9 +197,47 @@ class AppointmentWatcher:
             body = await resp.json()
             return body["scheduling"]["confirmationNumber"]
 
-    async def run_for_date(
-        self, date: datetime.date
-    ) -> tuple[Optional[datetime.datetime], datetime.date]:
+    async def handle_appointment(
+        self,
+        session: aiohttp.ClientSession,
+        date: datetime.date,
+        appt_time: Optional[datetime.datetime],
+        location: str,
+    ):
+        if not appt_time:
+            if self.zip_code:
+                logger.warning(
+                    f"No {self.appointment_type} appointments found on {date} within {self.radius} miles of ZIP {self.zip_code}"
+                )
+            else:
+                logger.warning(
+                    f"No {self.appointment_type} appointments found on {date} within {self.radius} miles of {self.city}, {self.state}"
+                )
+            return
+
+        # Have we seen this appointment before?
+        appt_string = f"{appt_time}-{location}"
+        if appt_string in self.appointments_found:
+            logger.warning(f"Skipping notification for appointment: {appt_string}")
+            return
+
+        if self.schedule:
+            confirmation_number = await self.create_appointment(
+                session, appt_time, facility_id
+            )
+            confirmation_url = f"https://tools.usps.com/rcas-confirmation.htm?confirmationNumber={confirmation_number}"
+            message = f"Found & scheduled passport appointment on {appt_time} at {location}. Visit {confirmation_url} to manage your appointment."
+        else:
+            message = f"Found passport appointment on {appt_time} at {location}; schedule it here: https://tools.usps.com/rcas.htm."
+
+        logger.warning(message)
+
+        if self.discord_webhook:
+            await send_discord_webhook(session, self.discord_webhook, message)
+
+        self.appointments_found.add(appt_string)
+
+    async def run_for_date(self, date: datetime.date):
         async with aiohttp.ClientSession(headers=HEADERS) as session:
             # Find a facility with an empty slot on the date.
             schedules = await self.list_facility_schedules(session, date)
@@ -231,31 +273,7 @@ class AppointmentWatcher:
                     )
                     break
 
-            if appt_time:
-                if self.schedule:
-                    confirmation_number = await self.create_appointment(
-                        session, appt_time, facility_id
-                    )
-                    confirmation_url = f"https://tools.usps.com/rcas-confirmation.htm?confirmationNumber={confirmation_number}"
-                    message = f"Found & scheduled passport appointment on {appt_time} at {location}. Visit {confirmation_url} to manage your appointment."
-                else:
-                    message = f"Found passport appointment on {appt_time} at {location}; schedule it here: https://tools.usps.com/rcas.htm."
-
-                logger.warning(message)
-
-                if self.discord_webhook:
-                    await send_discord_webhook(session, self.discord_webhook, message)
-            else:
-                if self.zip:
-                    logger.warning(
-                        f"No {self.appointment_type} appointments found on {date} within {self.radius} miles of ZIP {self.zip}"
-                    )
-                else:
-                    logger.warning(
-                        f"No {self.appointment_type} appointments found on {date} within {self.radius} miles of {self.city}, {self.state}"
-                    )
-
-            return appt_time, date
+            await self.handle_appointment(session, date, appt_time, location)
 
     def get_valid_dates(
         self,
@@ -303,18 +321,13 @@ class AppointmentWatcher:
 
             for chunk in chunk_iter:
                 tasks = [self.run_for_date(d) for d in chunk]
-                # Sort results by ascending date.
-                results = sorted(await asyncio.gather(*tasks), key=lambda x: x[1])
-                for appt_time, _ in results:
-                    if appt_time:
-                        # Return the first/earliest valid date.
-                        return appt_time
+                await asyncio.gather(*tasks)
 
             await asyncio.sleep(self.interval)
 
 
 @click.command()
-@click.option("--zip", type=str, help="ZIP code.")
+@click.option("--zip-code", type=str, help="ZIP code.")
 @click.option("--city-and-state", type=str, help="City and state (e.g., Austin, TX).")
 @click.option(
     "--radius",
@@ -385,7 +398,7 @@ class AppointmentWatcher:
     "--discord-webhook", type=str, help="Discord webhook URL to send notifications to."
 )
 def watcher(
-    zip: Optional[str],
+    zip_code: Optional[str],
     city_and_state: Optional[str],
     radius: int,
     interval: int,
@@ -400,11 +413,11 @@ def watcher(
     phone: Optional[str],
     discord_webhook: Optional[str],
 ):
-    if zip is None and city_and_state is None:
-        click.echo("One of --zip or --city-and-state must be set.", err=True)
+    if zip_code is None and city_and_state is None:
+        click.echo("One of --zip-code or --city-and-state must be set.", err=True)
         return
-    if zip is not None and city_and_state is not None:
-        click.echo("Only one of --zip or --city-and-state can be set.", err=True)
+    if zip_code is not None and city_and_state is not None:
+        click.echo("Only one of --zip-code or --city-and-state can be set.", err=True)
         return
 
     city, state = None, None
@@ -418,7 +431,7 @@ def watcher(
         end_date = datetime.datetime.strptime(end_date, "%Y%m%d").date()
 
     aw = AppointmentWatcher(
-        zip=zip,
+        zip_code=zip_code,
         city=city,
         state=state,
         radius=radius,

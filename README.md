@@ -13,16 +13,15 @@ pipenv shell
 ### Usage
 
 ```
-$ python watcher.py --help
 Usage: watcher.py [OPTIONS]
 
 Options:
-  --zip TEXT                     ZIP code.
+  --zip-code TEXT                ZIP code.
   --city-and-state TEXT          City and state (e.g., Austin, TX).
   --radius INTEGER               Radius to search for locations, in miles.
                                  [default: 10]
   --interval INTEGER             Interval in seconds between processing each
-                                 date.  [default: 3]
+                                 date.  [default: 5]
   --num-adults INTEGER           Number of adults for appointment.  [default:
                                  1]
   --num-minors INTEGER           Number of minors for appointment.  [default:
